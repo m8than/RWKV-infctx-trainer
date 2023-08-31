@@ -101,7 +101,7 @@ def check_optimizer_config():
         print("[RWKV.lightning_trainer.py] Detected invalid optimizer config '"+optimizer_config+"', defaulting to adam")
         LIGHTNING_CONFIG["trainer"]["optimizer"] = "adam"
         
-    if optimizer_config.contains("lamb"):
+    if "lamb" in optimizer_config:
         print("[RWKV.lightning_trainer.py] Detected optimizer config '"+optimizer_config+"' with lamb, please ensure warmup steps are set accordingly")
         # not sure if should be using the LR warmup as the optimizer freeze step value, worth looking into this.
 
