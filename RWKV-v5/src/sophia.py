@@ -8,7 +8,7 @@ from typing import List, Optional
 class SophiaG(Optimizer):
     def __init__(self, params, lr=1e-4, betas=(0.965, 0.99), rho = 0.04,
          weight_decay=1e-1, *, maximize: bool = False,
-         capturable: bool = False):
+         capturable: bool = False, update_hessian_interval: int = 10):
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
         if not 0.0 <= betas[0] < 1.0:
@@ -22,6 +22,10 @@ class SophiaG(Optimizer):
         defaults = dict(lr=lr, betas=betas, rho=rho, 
                         weight_decay=weight_decay, 
                         maximize=maximize, capturable=capturable)
+        
+        self.update_hessian_interval = update_hessian_interval
+        self.step_count = 0
+        
         super(SophiaG, self).__init__(params, defaults)
 
     def __setstate__(self, state):
@@ -62,6 +66,9 @@ class SophiaG(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+                
+        if self.step_count % self.update_hessian_interval == 0:
+            self.update_hessian()
 
         for group in self.param_groups:
             params_with_grad = []
@@ -110,6 +117,8 @@ class SophiaG(Optimizer):
                   weight_decay=group['weight_decay'],
                   maximize=group['maximize'],
                   capturable=group['capturable'])
+            
+            self.step_count += 1
 
         return loss
 

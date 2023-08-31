@@ -797,10 +797,12 @@ class RWKV(L.LightningModule):
                                     weight_decay=self.weight_decay)
             elif self.optimizer_name == "sophia":
                 from src.sophia import SophiaG
+                batch_size = self.trainer.accumulate_grad_batches * self.trainer.num_nodes * self.trainer.num_devices
                 optimizer = SophiaG(optim_groups,
                                     lr=lr_init,
                                     betas=(self.beta1, self.beta2),
-                                    weight_decay=self.weight_decay)
+                                    weight_decay=self.weight_decay,
+                                    update_hessian_interval=int(batch_size / 1200))
             elif self.optimizer_name == "lion":
                 from lion_pytorch import Lion
                 optimizer = Lion(optim_groups,
