@@ -257,7 +257,7 @@ def remove_arg(argList, argCommand):
 # Remove the --auto-resume-ckpt-dir and --auto-resume-ckpt-offset
 PYTORCH_CLI_ARGV = remove_arg(PYTORCH_CLI_ARGV, "--auto-resume-ckpt-dir")
 PYTORCH_CLI_ARGV = remove_arg(PYTORCH_CLI_ARGV, "--auto-resume-ckpt-mode")
-PYTORCH_CLI_ARGV = remove_arg(PYTORCH_CLI_ARGV, "--trainer.optimizer")
+PYTORCH_CLI_ARGV = remove_arg(PYTORCH_CLI_ARGV, "trainer.optimizer")
 
 # ---
 
