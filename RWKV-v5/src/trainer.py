@@ -18,7 +18,6 @@ class RWKVLightningTrainer(Trainer):
             # automatically compute the accumulate_grad_batches
             # according to the num_nodes, and num_devices configured
             target_batch_size=-1,
-            optimizer="adam",
             # Handle the rest of args, as per normal
             **kwargs,
         ):
@@ -80,6 +79,9 @@ class RWKVLightningTrainer(Trainer):
             wandb.config.update({
                 "trainer": trainer_config
             })
+
+        # Remove unnecessary args
+        del kwargs["optimizer"]
 
         # Call the parent constructor
         super().__init__(*args, **kwargs)

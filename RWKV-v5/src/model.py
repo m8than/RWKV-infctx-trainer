@@ -599,8 +599,6 @@ class RWKV(L.LightningModule):
         self.substep_cuda_cache_clear = substep_cuda_cache_clear
         self.substep_logging = substep_logging
         self.optimizer_name = optimizer
-        
-        print("Optimizer: ", optimizer)
 
         # Save the position loss params
         self.position_loss_bias = position_loss_bias
@@ -761,6 +759,7 @@ class RWKV(L.LightningModule):
                                          weight_decay=self.weight_decay,
                                          amsgrad=False)
         else:
+            print("Optimizer: ", self.optimizer_name)
             # ["onebitadam", "onebitlamb", "zerooneadam", "lamb"]
             if self.optimizer_name == "onebitadam":
                 from deepspeed.ops.adam import OneBitAdam
