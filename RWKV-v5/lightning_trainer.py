@@ -83,8 +83,8 @@ def check_optimizer_config():
     # Get the optimizer config
     optimizer_config = LIGHTNING_CONFIG.get("trainer", {}).get("optimizer", "")
     
-    # if "--trainer.optimizer" in CLI_ARGS_MAP:
-    #     optimizer_config = CLI_ARGS_MAP["--trainer.optimizer"]
+    if "--trainer.optimizer" in CLI_ARGS_MAP:
+        optimizer_config = CLI_ARGS_MAP["--trainer.optimizer"]
         
     if optimizer_config == "" or optimizer_config is None:
         print("[RWKV.lightning_trainer.py] Detected empty optimizer config, defaulting to adam")
@@ -257,6 +257,7 @@ def remove_arg(argList, argCommand):
 # Remove the --auto-resume-ckpt-dir and --auto-resume-ckpt-offset
 PYTORCH_CLI_ARGV = remove_arg(PYTORCH_CLI_ARGV, "--auto-resume-ckpt-dir")
 PYTORCH_CLI_ARGV = remove_arg(PYTORCH_CLI_ARGV, "--auto-resume-ckpt-mode")
+PYTORCH_CLI_ARGV = remove_arg(PYTORCH_CLI_ARGV, "--trainer.optimizer")
 
 # ---
 
