@@ -79,6 +79,9 @@ class RWKVLightningTrainer(Trainer):
             wandb.config.update({
                 "trainer": trainer_config
             })
+            
+        # Remove unnecessary args
+        del kwargs["trainer.optimizer"]
 
         # Call the parent constructor
         super().__init__(*args, **kwargs)

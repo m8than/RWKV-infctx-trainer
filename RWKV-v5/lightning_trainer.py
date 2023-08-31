@@ -102,10 +102,11 @@ def check_optimizer_config():
         LIGHTNING_CONFIG["trainer"]["optimizer"] = "adam"
         
     if "lamb" in optimizer_config:
-        print("[RWKV.lightning_trainer.py] Detected optimizer config '"+optimizer_config+", please ensure warmup steps are set accordingly")
+        print("[RWKV.lightning_trainer.py] Detected optimizer config '"+optimizer_config+"', please ensure warmup steps are set accordingly")
         # not sure if should be using the LR warmup as the optimizer freeze step value, worth looking into this.
 
 check_optimizer_config()
+
 #
 # Handle --auto-resume-ckpt-dir and --auto-resume-ckpt-mode parameters
 # by modifyiing the argv list if needed.
@@ -257,17 +258,16 @@ def remove_arg(argList, argCommand):
 # Remove the --auto-resume-ckpt-dir and --auto-resume-ckpt-offset
 PYTORCH_CLI_ARGV = remove_arg(PYTORCH_CLI_ARGV, "--auto-resume-ckpt-dir")
 PYTORCH_CLI_ARGV = remove_arg(PYTORCH_CLI_ARGV, "--auto-resume-ckpt-mode")
-PYTORCH_CLI_ARGV = remove_arg(PYTORCH_CLI_ARGV, "trainer.optimizer")
 
 # ---
 
-from lightning.pytorch.cli import LightningCLI
+from src.rwkv_cli import RWKVLightningCLI
 from src.model import RWKV
 from src.data import RWKVDataModule
 from src.trainer import RWKVLightningTrainer
 
 def cli_main():
-    LightningCLI(
+    RWKVLightningCLI(
         RWKV, RWKVDataModule, 
         save_config_kwargs={"overwrite": True},
         trainer_class=RWKVLightningTrainer,
