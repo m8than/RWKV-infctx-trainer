@@ -805,6 +805,7 @@ class RWKV(L.LightningModule):
                 from lion_pytorch import Lion
                 optimizer = Lion(optim_groups,
                                     lr=lr_init,
+                                    betas=(self.beta1, self.beta2),
                                     weight_decay=self.weight_decay,
                                     use_triton=True)
             else:
