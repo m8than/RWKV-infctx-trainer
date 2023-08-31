@@ -49,17 +49,23 @@ with open(CONFIG_FILE_PATH, 'r') as f:
     LIGHTNING_CONFIG = yaml.safe_load(f)
 assert LIGHTNING_CONFIG is not None, "Failed to load config file: "+CONFIG_FILE_PATH
 
-# We need to detect if deepspeed 3 is being used, either as defined
-# by the config file, or by the command line arguments. 
-# Before loading the respective RWKV modules, with the required env vars
-# ---
-def disable_jit_if_deepspeed_3():
+def get_trainer_strategy():
     # Get the configured deepspeed strat
     assumed_deepspeed_strategy = LIGHTNING_CONFIG.get("trainer", {}).get("strategy", "")
 
     # Check if there is a trainer.strategy in the command line arguments
     if "--trainer.strategy" in CLI_ARGS_MAP:
         assumed_deepspeed_strategy = CLI_ARGS_MAP["--trainer.strategy"]
+        
+    return assumed_deepspeed_strategy
+    
+
+# We need to detect if deepspeed 3 is being used, either as defined
+# by the config file, or by the command line arguments. 
+# Before loading the respective RWKV modules, with the required env vars
+# ---
+def disable_jit_if_deepspeed_3():
+    assumed_deepspeed_strategy = get_trainer_strategy()
 
     # Finally lets check if the assumed_deepspeed_strategy contains the text "deepspeed_stage_3"
     # And disable JIT, as its not supported by deepspeed_stage_3
@@ -70,6 +76,36 @@ def disable_jit_if_deepspeed_3():
 # Perform the deepspeed 3 check
 disable_jit_if_deepspeed_3()
 
+
+def check_optimizer_config():
+    assumed_deepspeed_strategy = get_trainer_strategy()
+    
+    # Get the optimizer config
+    optimizer_config = LIGHTNING_CONFIG.get("trainer", {}).get("optimizer", "")
+    
+    if "--trainer.optimizer" in CLI_ARGS_MAP:
+        optimizer_config = CLI_ARGS_MAP["--trainer.optimizer"]
+        
+    if optimizer_config == "" or optimizer_config is None:
+        print("[RWKV.lightning_trainer.py] Detected empty optimizer config, defaulting to adam")
+        LIGHTNING_CONFIG["trainer"]["optimizer"] = "adam"
+    
+    optimizer_offload = assumed_deepspeed_strategy.endswith("_offload")
+    
+    if optimizer_config in ["onebitadam", "onebitlamb", "zerooneadam", "lamb"] and optimizer_offload:
+        # gpu only optimizers
+        print("[RWKV.lightning_trainer.py] Detected optimizer config '"+optimizer_config+"' with optimizer_offload, defaulting to adam")
+        LIGHTNING_CONFIG["trainer"]["optimizer"] = "adam"
+        
+    if optimizer_config not in ["onebitadam", "onebitlamb", "zerooneadam", "lamb", "adam"]:
+        print("[RWKV.lightning_trainer.py] Detected invalid optimizer config '"+optimizer_config+"', defaulting to adam")
+        LIGHTNING_CONFIG["trainer"]["optimizer"] = "adam"
+        
+    if optimizer_config.contains("lamb"):
+        print("[RWKV.lightning_trainer.py] Detected optimizer config '"+optimizer_config+"' with lamb, please ensure warmup steps are set accordingly")
+        # not sure if should be using the LR warmup as the optimizer freeze step value, worth looking into this.
+
+check_optimizer_config()
 #
 # Handle --auto-resume-ckpt-dir and --auto-resume-ckpt-mode parameters
 # by modifyiing the argv list if needed.

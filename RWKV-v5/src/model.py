@@ -18,7 +18,7 @@ from lightning.pytorch.utilities import rank_zero_info, rank_zero_only
 from lightning.pytorch.strategies import DeepSpeedStrategy
 
 import deepspeed
-from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam, OneBitAdam, OneBitLamb, ZeroOneAdam, FusedLamb
 import deepspeed.runtime.lr_schedules
 import wandb
 
@@ -528,7 +528,8 @@ class RWKV(L.LightningModule):
                  dim_ffn: Optional[int] = None,
                  substep_cuda_cache_clear: bool = False,
                  substep_logging: bool = False,
-                 torch_set_float32_matmul_precision:str = 'high'
+                 torch_set_float32_matmul_precision:str = 'high',
+                 optimizer: str = 'adam',
                  ):
 
         # Lets save everything in one shot
@@ -597,6 +598,7 @@ class RWKV(L.LightningModule):
         self.bptt_truncated_learning = bptt_truncated_learning
         self.substep_cuda_cache_clear = substep_cuda_cache_clear
         self.substep_logging = substep_logging
+        self.optimizer_name = optimizer
 
         # Save the position loss params
         self.position_loss_bias = position_loss_bias
@@ -684,7 +686,7 @@ class RWKV(L.LightningModule):
 
             lr_init_e = "{:.3e}".format(lr_init)
             lr_final_e = "{:.3e}".format(lr_final)
-            print(f"\n[RWKV.model] Configuring optimizer with\n"+
+            print(f"\n[RWKV.model] Configuring optimizer ({self.optimizer_name}) with\n"+
                   f"    - lr_init:  {lr_init_e} ({lr_init})\n"+
                   f"    - lr_final: {lr_final_e} ({lr_final})\n")
 
@@ -757,14 +759,48 @@ class RWKV(L.LightningModule):
                                          weight_decay=self.weight_decay,
                                          amsgrad=False)
         else:
-            optimizer = FusedAdam(optim_groups,
-                                  lr=lr_init,
-                                  betas=(self.beta1, self.beta2),
-                                  eps=self.adam_eps,
-                                  bias_correction=True,
-                                  adam_w_mode=False,
-                                  weight_decay=self.weight_decay,
-                                  amsgrad=False)
+            # ["onebitadam", "onebitlamb", "zerooneadam", "lamb"]
+            if self.optimizer_name == "onebitadam":
+                optimizer = OneBitAdam(optim_groups,
+                                    lr=lr_init,
+                                    betas=(self.beta1, self.beta2),
+                                    eps=self.adam_eps,
+                                    bias_correction=True,
+                                    weight_decay=self.weight_decay)
+            elif self.optimizer_name == "onebitlamb":
+                # also supports cuda_aware, coeff_beta, factor_max, factor_min and factor_threshold
+                optimizer = OneBitLamb(optim_groups,
+                                    lr=lr_init,
+                                    freeze_step=self.trainer.max_steps * 0.15, # self.warmup_steps,
+                                    betas=(self.beta1, self.beta2),
+                                    eps=self.adam_eps,
+                                    bias_correction=True,
+                                    weight_decay=self.weight_decay)
+            elif self.optimizer_name == "zerooneadam":
+                optimizer = ZeroOneAdam(optim_groups,
+                                    lr=lr_init,
+                                    betas=(self.beta1, self.beta2),
+                                    eps=self.adam_eps,
+                                    bias_correction=True,
+                                    weight_decay=self.weight_decay,
+                                    amsgrad=False)
+            elif self.optimizer_name == "lamb":
+                optimizer = FusedLamb(optim_groups,
+                                    lr=lr_init,
+                                    betas=(self.beta1, self.beta2),
+                                    eps=self.adam_eps,
+                                    bias_correction=True,
+                                    weight_decay=self.weight_decay)
+            else:
+                optimizer = FusedAdam(optim_groups,
+                                    lr=lr_init,
+                                    betas=(self.beta1, self.beta2),
+                                    eps=self.adam_eps,
+                                    bias_correction=True,
+                                    adam_w_mode=False,
+                                    weight_decay=self.weight_decay,
+                                    amsgrad=False)
+                
             
         # Throw if wramup_steps and lr_period are both set (not supported)
         if self.warmup_steps > 0 and self.lr_period > 0:
