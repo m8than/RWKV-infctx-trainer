@@ -18,7 +18,7 @@ from lightning.pytorch.utilities import rank_zero_info, rank_zero_only
 from lightning.pytorch.strategies import DeepSpeedStrategy
 
 import deepspeed
-from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam, OneBitAdam, OneBitLamb, ZeroOneAdam, FusedLamb
+from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 import deepspeed.runtime.lr_schedules
 import wandb
 
@@ -761,6 +761,7 @@ class RWKV(L.LightningModule):
         else:
             # ["onebitadam", "onebitlamb", "zerooneadam", "lamb"]
             if self.optimizer_name == "onebitadam":
+                from deepspeed.ops.adam import OneBitAdam
                 optimizer = OneBitAdam(optim_groups,
                                     lr=lr_init,
                                     betas=(self.beta1, self.beta2),
@@ -769,6 +770,7 @@ class RWKV(L.LightningModule):
                                     weight_decay=self.weight_decay)
             elif self.optimizer_name == "onebitlamb":
                 # also supports cuda_aware, coeff_beta, factor_max, factor_min and factor_threshold
+                from deepspeed.runtime.fp16.onebit.lamb import OneBitLamb
                 optimizer = OneBitLamb(optim_groups,
                                     lr=lr_init,
                                     freeze_step=self.trainer.max_steps * 0.15, # self.warmup_steps,
@@ -777,6 +779,7 @@ class RWKV(L.LightningModule):
                                     bias_correction=True,
                                     weight_decay=self.weight_decay)
             elif self.optimizer_name == "zerooneadam":
+                from deepspeed.runtime.fp16.onebit.zoadam import ZeroOneAdam
                 optimizer = ZeroOneAdam(optim_groups,
                                     lr=lr_init,
                                     betas=(self.beta1, self.beta2),
@@ -785,6 +788,7 @@ class RWKV(L.LightningModule):
                                     weight_decay=self.weight_decay,
                                     amsgrad=False)
             elif self.optimizer_name == "lamb":
+                from deepspeed.ops.lamb import FusedLamb
                 optimizer = FusedLamb(optim_groups,
                                     lr=lr_init,
                                     betas=(self.beta1, self.beta2),
