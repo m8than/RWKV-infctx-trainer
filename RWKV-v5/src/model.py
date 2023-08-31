@@ -796,8 +796,8 @@ class RWKV(L.LightningModule):
                                     bias_correction=True,
                                     weight_decay=self.weight_decay)
             elif self.optimizer_name == "sophia":
-                from src.sophia import Sophia
-                optimizer = Sophia(optim_groups,
+                from src.sophia import SophiaG
+                optimizer = SophiaG(optim_groups,
                                     lr=lr_init,
                                     betas=(self.beta1, self.beta2),
                                     weight_decay=self.weight_decay)
