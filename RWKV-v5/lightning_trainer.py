@@ -83,8 +83,8 @@ def check_optimizer_config():
     # Get the optimizer config
     optimizer_config = LIGHTNING_CONFIG.get("trainer", {}).get("optimizer", "")
     
-    if "--trainer.optimizer" in CLI_ARGS_MAP:
-        optimizer_config = CLI_ARGS_MAP["--trainer.optimizer"]
+    # if "--trainer.optimizer" in CLI_ARGS_MAP:
+    #     optimizer_config = CLI_ARGS_MAP["--trainer.optimizer"]
         
     if optimizer_config == "" or optimizer_config is None:
         print("[RWKV.lightning_trainer.py] Detected empty optimizer config, defaulting to adam")
