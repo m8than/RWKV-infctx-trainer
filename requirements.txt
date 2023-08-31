@@ -14,3 +14,5 @@ tokenizers==0.13.3
 wandb==0.15.5
 jsonargparse==4.22.1
 jsonargparse[signatures]
+lion-pytorch
+triton

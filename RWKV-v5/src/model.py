@@ -759,7 +759,6 @@ class RWKV(L.LightningModule):
                                          weight_decay=self.weight_decay,
                                          amsgrad=False)
         else:
-            print("Optimizer: ", self.optimizer_name)
             # ["onebitadam", "onebitlamb", "zerooneadam", "lamb"]
             if self.optimizer_name == "onebitadam":
                 from deepspeed.ops.adam import OneBitAdam
@@ -796,6 +795,18 @@ class RWKV(L.LightningModule):
                                     eps=self.adam_eps,
                                     bias_correction=True,
                                     weight_decay=self.weight_decay)
+            elif self.optimizer_name == "sophia":
+                from src.sophia import Sophia
+                optimizer = Sophia(optim_groups,
+                                    lr=lr_init,
+                                    betas=(self.beta1, self.beta2),
+                                    weight_decay=self.weight_decay)
+            elif self.optimizer_name == "lion":
+                from lion_pytorch import Lion
+                optimizer = Lion(optim_groups,
+                                    lr=lr_init,
+                                    weight_decay=self.weight_decay,
+                                    use_triton=True)
             else:
                 optimizer = FusedAdam(optim_groups,
                                     lr=lr_init,

@@ -97,12 +97,18 @@ def check_optimizer_config():
         print("[RWKV.lightning_trainer.py] Detected optimizer config '"+optimizer_config+"' with optimizer_offload, defaulting to adam")
         LIGHTNING_CONFIG["trainer"]["optimizer"] = "adam"
         
-    if optimizer_config not in ["onebitadam", "onebitlamb", "zerooneadam", "lamb", "adam"]:
+    if optimizer_config not in ["onebitadam", "onebitlamb", "zerooneadam", "lamb", "adam", "sophia", "lion"]:
         print("[RWKV.lightning_trainer.py] Detected invalid optimizer config '"+optimizer_config+"', defaulting to adam")
         LIGHTNING_CONFIG["trainer"]["optimizer"] = "adam"
+    
+    if optimizer_config == "sophia":
+        print("[RWKV.lightning_trainer.py] Detected optimizer config '"+optimizer_config+"', Sophia is supposed to work best with double the learning rate of adam and a larger weight decay")
+    
+    if optimizer_config == "lion":
+        print("[RWKV.lightning_trainer.py] Detected optimizer config '"+optimizer_config+"', Lion is supposed to work best with 3-10x smaller learning rate than adam with a 3-10x larger weight decay")
         
-    if "lamb" in optimizer_config:
-        print("[RWKV.lightning_trainer.py] Detected optimizer config '"+optimizer_config+"', please ensure warmup steps are set accordingly")
+    # if "lamb" in optimizer_config:
+    #     print("[RWKV.lightning_trainer.py] Detected optimizer config '"+optimizer_config+"', please ensure warmup steps are set accordingly")
         # not sure if should be using the LR warmup as the optimizer freeze step value, worth looking into this.
 
 check_optimizer_config()
