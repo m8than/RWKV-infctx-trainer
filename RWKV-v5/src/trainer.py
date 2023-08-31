@@ -18,6 +18,7 @@ class RWKVLightningTrainer(Trainer):
             # automatically compute the accumulate_grad_batches
             # according to the num_nodes, and num_devices configured
             target_batch_size=-1,
+            optimizer="adam",
             # Handle the rest of args, as per normal
             **kwargs,
         ):
