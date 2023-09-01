@@ -802,7 +802,7 @@ class RWKV(L.LightningModule):
                                     lr=lr_init,
                                     betas=(self.beta1, self.beta2),
                                     weight_decay=self.weight_decay,
-                                    update_hessian_interval=int(batch_size / 1200))
+                                    update_hessian_interval=math.ceil(1200 / batch_size))
             elif self.optimizer_name == "lion":
                 from lion_pytorch import Lion
                 optimizer = Lion(optim_groups,
