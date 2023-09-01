@@ -750,14 +750,23 @@ class RWKV(L.LightningModule):
 
         # Setup the adam optimizers
         if self.deepspeed_offload:
-            optimizer = DeepSpeedCPUAdam(optim_groups,
-                                         lr=lr_init,
-                                         betas=(self.beta1, self.beta2),
-                                         eps=self.adam_eps,
-                                         bias_correction=True,
-                                         adamw_mode=False,
-                                         weight_decay=self.weight_decay,
-                                         amsgrad=False)
+            if self.optimizer_name == "sophia":
+                from src.sophia import SophiaG
+                batch_size = self.trainer.accumulate_grad_batches * self.trainer.num_nodes * self.trainer.num_devices
+                optimizer = SophiaG(optim_groups,
+                                    lr=lr_init,
+                                    betas=(self.beta1, self.beta2),
+                                    weight_decay=self.weight_decay,
+                                    update_hessian_interval=math.ceil(1200 / batch_size))
+            else:
+                optimizer = DeepSpeedCPUAdam(optim_groups,
+                                            lr=lr_init,
+                                            betas=(self.beta1, self.beta2),
+                                            eps=self.adam_eps,
+                                            bias_correction=True,
+                                            adamw_mode=False,
+                                            weight_decay=self.weight_decay,
+                                            amsgrad=False)
         else:
             # ["onebitadam", "onebitlamb", "zerooneadam", "lamb"]
             if self.optimizer_name == "onebitadam":
