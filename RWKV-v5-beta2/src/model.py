@@ -102,6 +102,10 @@ elif RWKV_JIT_ON:
     JITModMethod = torch.jit.script_method
     JITFunction  = torch.jit.script
 
+    # JITModClass  = nn.Module
+    # JITModMethod = lambda x: x
+    # JITFunction  = lambda x: x
+
     TCompileMax        = lambda x: x
     TCompileBaseline   = lambda x: x
     TCompileDisable    = lambda x: x
@@ -126,10 +130,6 @@ print(f"[RWKV.model] Running RWKV model using '{RWKV_TORCH_RUN_MODE}' with torch
 @TCompileDisable
 def deepspeed_checkpoint(*args, **kwargs):
     return deepspeed.checkpointing.checkpoint(*args, **kwargs)
-
-@TCompileDisable
-def wkv_op(time_decay, time_first, k, v, wkv_state):
-    return torch.ops.rwkv.wkv(time_decay, time_first, k, v, wkv_state)
 
 ########################################################################################################
 # RWKV: State Blocks
@@ -164,18 +164,20 @@ class BlockStateList:
 
     # @ TCompileMax (no difference)
     @staticmethod
-    def create(N, B, C, device, dtype):
-        result = BlockStateList.empty(N, B, C, device, dtype)
+    def create(N, B, C, n_head, head_size, device, dtype):
+        result = BlockStateList.empty(N, B, C, n_head, head_size, device, dtype)
         result.wkv_states[:] = 0
-        result.wkv_states[:, :, :, -1] = -1e38
+        # result.wkv_states[:, :, :, -1] = -1e38
         result.shift_states[:] = 0
         return result
 
     # @ TCompileMax (no difference)
     @staticmethod
-    def empty(N, B, C, device, dtype):
-        wkv_states = torch.empty((N, B, C, 3),
+    def empty(N, B, C, n_head, head_size, device, dtype):
+        # @TODO: confirm if dtype can be changed from .flaot to dtype=dtype (when bf16)
+        wkv_states = torch.empty((N, B, n_head, head_size, head_size),
                                  device=device,
+                                #  dtype=dtype)
                                  dtype=torch.float)
         shift_states = torch.empty((N, 2, B, C), device=device, dtype=dtype)
         return BlockStateList(shift_states, wkv_states)
@@ -196,8 +198,20 @@ class BlockStateList:
 
 class RWKV_TimeMix(JITModClass):
 
-    def __init__(self, layer_id, n_layer, n_embd, dim_att):
+    def __init__(self, layer_id, n_layer, n_embd, n_head, head_size, dim_att):
         super().__init__()
+        
+        self.dim_att = dim_att
+        self.n_layer = n_layer
+        self.n_embd = n_embd
+        self.layer_id = layer_id
+
+        self.n_head = n_head
+        self.head_size = head_size
+
+        # Optimized chunk length is fixed for now
+        self.chunk_len = 512
+        # assert ctx_len % self.chunk_len == 0
 
         with torch.no_grad():  # fancy init
             ratio_0_to_1 = layer_id / (n_layer - 1)  # 0 to 1
@@ -206,77 +220,141 @@ class RWKV_TimeMix(JITModClass):
             for i in range(n_embd):
                 ddd[0, 0, i] = i / n_embd
 
+            # fancy time_mix
+            self.time_mix_k = nn.Parameter(torch.pow(ddd, ratio_1_to_almost0))
+            self.time_mix_v = nn.Parameter(torch.pow(ddd, ratio_1_to_almost0) + 0.3 * ratio_0_to_1)
+            self.time_mix_r = nn.Parameter(torch.pow(ddd, 0.5 * ratio_1_to_almost0))
+
             # fancy time_decay
-            decay_speed = torch.ones(dim_att)
-            for h in range(dim_att):
-                decay_speed[h] = -5 + 8 * (h /
-                                           (dim_att - 1))**(0.7 +
-                                                            1.3 * ratio_0_to_1)
+            decay_speed = torch.ones(n_head)
+            for h in range(n_head):
+                decay_speed[h] = -8 + 7 * (h / (n_head - 1)) ** (0.7 + 1.3 * ratio_0_to_1)
             self.time_decay = nn.Parameter(decay_speed)
             # print(layer_id, self.time_decay.flatten()[:3].cpu().numpy(), '...', self.time_decay.flatten()[-3:].cpu().numpy())
 
-            # fancy time_first
-            zigzag = torch.tensor([(i + 1) % 3 - 1
-                                   for i in range(dim_att)]) * 0.5
-            self.time_first = nn.Parameter(
-                torch.ones(dim_att) * math.log(0.3) + zigzag)
+            # V5-R2 changes
+            self.time_faaaa = nn.Parameter(torch.ones(n_head) * 0.05)
+            # self.time_first = nn.Parameter(torch.ones(n_head) * (-3.0))
 
-            # fancy time_mix
-            self.time_mix_k = nn.Parameter(torch.pow(ddd, ratio_1_to_almost0))
-            self.time_mix_v = nn.Parameter(
-                torch.pow(ddd, ratio_1_to_almost0) + 0.3 * ratio_0_to_1)
-            self.time_mix_r = nn.Parameter(
-                torch.pow(ddd, 0.5 * ratio_1_to_almost0))
-
+        # self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
+        self.receptance = nn.Linear(n_embd, dim_att, bias=False)
         self.key = nn.Linear(n_embd, dim_att, bias=False)
         self.value = nn.Linear(n_embd, dim_att, bias=False)
-        self.receptance = nn.Linear(n_embd, dim_att, bias=False)
         self.output = nn.Linear(dim_att, n_embd, bias=False)
 
+        self.ln_x = nn.GroupNorm(n_head, n_embd)
+
+    # this is based on jit_func(self,x)
     @JITModMethod
-    @TCompileMax
-    def _forward_kvsr(self, x, last_state: TimeMixState):
+    def _forward_rkv_chunk(self, x, B, TT, last_state: TimeMixState):
         # Mix x with the previous timestep to produce xk, xv, xr
-        xx = torch.concat((last_state.shift_state.unsqueeze(1), x[:, :-1]),
-                          dim=1)
+        xx = torch.concat((last_state.shift_state.unsqueeze(1), x[:, :-1]), dim=1)
+        # xx = self.time_shift(x)
+
         xk = x * self.time_mix_k + xx * (1 - self.time_mix_k)
         xv = x * self.time_mix_v + xx * (1 - self.time_mix_v)
         xr = x * self.time_mix_r + xx * (1 - self.time_mix_r)
 
-        k = self.key(xk)
-        v = self.value(xv)
-        r = self.receptance(xr)
+        r = self.receptance(xr).view(B, TT, self.n_head, self.head_size).transpose(1, 2)            # BTC -> BHTS
+        k = self.key(xk).view(B, TT, self.n_head, self.head_size).transpose(1, 2).transpose(-2, -1) # BTC -> BHTS -> BHST
+        v = self.value(xv).view(B, TT, self.n_head, self.head_size).transpose(1, 2)                 # BTC -> BHTS
 
-        sr = torch.sigmoid(r)
+        return r, k, v
 
-        # Enforce bf16 type for kv, as this can be mis init
-        # when being called directly via inference
-        if k.dtype != torch.bfloat16:
-            k = k.to(torch.bfloat16)
-        if v.dtype != torch.bfloat16:
-            v = v.to(torch.bfloat16)
+    def _forward_wkbs_chunk(self, T, r, k, v):
+        H = self.n_head
 
-        return k, v, sr
+        w = torch.exp(-torch.exp(self.time_decay.float())).unsqueeze(-1)
+
+        # V5-R2 changes
+        u = self.time_faaaa.float().unsqueeze(-1)
+        # u = torch.exp(self.time_first.float()).unsqueeze(-1)
+
+        ws = w.pow(T).reshape(1, H, 1, 1)
+        ind = torch.arange(T-1, -1, -1, device=r.device).unsqueeze(0).repeat(H, 1)
+        w = w.repeat(1, T).pow(ind)
+
+        wk = w.reshape(1, H, 1, T)
+        wb = wk.transpose(-2, -1).flip(2)
+
+        w = torch.cat([w[:, 1:], u], dim=1)
+        w = F.pad(w, (0, T))
+        w = torch.tile(w, [T])
+        w = w[:, :-T].reshape(-1, T, 2 * T - 1)
+        w = w[:, :, T-1:].reshape(1, H, T, T)
+
+        w = w.to(dtype=r.dtype)
+        wk = wk.to(dtype=r.dtype)
+        wb = wb.to(dtype=r.dtype)
+        ws = ws.to(dtype=r.dtype)
+
+        return w, wk, wb, ws
 
     @JITModMethod
+    def _forward_state_chunk(self, r, k, v, w, wk, wb, ws, x_l, last_state: TimeMixState):
+        B, H, TT, S = r.size()
+        T = TT
+
+        # s = torch.zeros(B, H, S, S, device=r.device, dtype=r.dtype)  # state
+        s = last_state.wkv_state
+
+        if r.dtype == torch.bfloat16 and s.dtype != torch.bfloat16:
+            s = s.contiguous().to(torch.bfloat16)
+
+        x = torch.zeros(B, H, TT, S, device=r.device, dtype=r.dtype) # output
+
+        ########################################################################
+        for i in range(TT // T):
+        
+            rr = r[:, :, i*T:i*T+T, :]
+            kk = k[:, :, :, i*T:i*T+T]
+            vv = v[:, :, i*T:i*T+T, :]
+
+            x[:, :, i*T:i*T+T, :] = ((rr @ kk) * w) @ vv  +  (rr @ s) * wb
+
+            s = ws * s + (kk * wk) @ vv
+        ########################################################################
+        
+        x = x.transpose(1, 2).contiguous().view(B * TT, H*S) # BHTS -> BTHS -> BTC
+        x = self.ln_x(x/8).view(B, TT, H*S)
+
+        return self.output(x), TimeMixState(x_l, s)
+
+    def _forward_chunk(self, x, last_state: TimeMixState):
+        # Forward sizings (Batch, Time/ContextLength, Tokens)
+        B, TT, C = x.size()
+        B = torch.tensor(B, device=x.device, dtype=torch.int32)
+        TT = torch.tensor(TT, device=x.device, dtype=torch.int32)
+
+        # Get r, k, v (self.jit_func(x))
+        r, k, v = self._forward_rkv_chunk(x, B, TT, last_state)
+
+        # Get w, wk, wb, ws (self.jit_func_2)
+        w, wk, wb, ws = self._forward_wkbs_chunk(TT, r, k, v)
+
+        # Does the state forwarding
+        return self._forward_state_chunk(r, k, v, w, wk, wb, ws, x[:, -1], last_state)
+
     @TCompileMax
-    def _forward_out(self, sr, y, x_l, new_wkv_state):
-        return self.output(sr * y), TimeMixState(x_l, new_wkv_state)
-
-    @JITModMethod
-    @TCompileBaseline
     def forward(self, x, last_state: TimeMixState):
-        k, v, sr = self._forward_kvsr(x, last_state)
+        # Get the x sizing
+        B, TT, C = x.size()
 
-        # Enforce bf16 for self.time_first
-        # as this can be mis init when being called directly via inference
-        if self.time_first.dtype != torch.bfloat16:
-            self.time_first = self.time_first.to(torch.bfloat16)
+        # Chunk length to split by, 
+        # we probably can reoptimize this at some point
+        chunk_len = self.chunk_len
 
-        # Perform the WKV op via cuda code
-        y, new_wkv_state = wkv_op(self.time_decay, self.time_first,
-                                  k, v, last_state.wkv_state)
-        return self._forward_out(sr, y, x[:, -1], new_wkv_state)
+        # Logits to return
+        x_logits = torch.zeros(B, TT, C, device=x.device, dtype=x.dtype)
+
+        # Split the input by TT chunks
+        for i in range(0, TT, chunk_len):
+            x_chunk = x[:, i:i+chunk_len, :]
+            chunk_logits, last_state = self._forward_chunk(x_chunk, last_state)
+            x_logits[:, i:i+chunk_len, :] = chunk_logits
+
+        # Return the logits and the state
+        return x_logits, last_state
 
 
 ########################################################################################################
@@ -319,7 +397,7 @@ class RWKV_ChannelMix(JITModClass):
 
 class Block(nn.Module):
 
-    def __init__(self, layer_id, n_layer, n_embd, dim_att, dim_ffn):
+    def __init__(self, layer_id, n_layer, n_embd, n_head, head_size, dropout, dim_att, dim_ffn):
         super().__init__()
         self.layer_id = layer_id
 
@@ -329,22 +407,41 @@ class Block(nn.Module):
         if self.layer_id == 0:
             self.ln0 = nn.LayerNorm(n_embd)
 
-        self.att = RWKV_TimeMix(layer_id, n_layer, n_embd, dim_att)
+        self.att = RWKV_TimeMix(layer_id, n_layer, n_embd, n_head, head_size, dim_att)
         self.ffn = RWKV_ChannelMix(layer_id, n_layer, n_embd, dim_ffn)
+
+        # Setup droupout at block level
+        self.dropout = dropout
+        if dropout > 0:            
+            self.drop0 = nn.Dropout(p = dropout)
+            self.drop1 = nn.Dropout(p = dropout)
 
     def forward(self, x, last_state: BlockState):
         if self.layer_id == 0:
             x = self.ln0(x)
+
         att_out, att_state = self.att(
             self.ln1(x),
             last_state.time_mix_state,
         )
-        x = x + att_out
-        ffn_out, ffn_state = self.ffn(
-            self.ln2(x),
-            last_state.channel_mix_state,
-        )
-        x = x + ffn_out
+
+        if self.dropout > 0.0:
+            # Handle with dropout
+            x = self.drop0(x + att_out)
+            ffn_out, ffn_state = self.ffn(
+                self.ln2(x),
+                last_state.channel_mix_state,
+            )
+            x = self.drop1(x + ffn_out)
+        else:
+            # Handle without dropout
+            x = x + att_out
+            ffn_out, ffn_state = self.ffn(
+                self.ln2(x),
+                last_state.channel_mix_state,
+            )
+            x = x + ffn_out
+        
         return x, BlockState(att_state, ffn_state)
 
 
@@ -410,6 +507,8 @@ class RWKV(L.LightningModule):
                  lr_final: float = -1.0,
                  lr_period: int = -1,
                  lr_period_type: str = 'epoch',
+                 # Dropout rate
+                 dropout: float = 0.0,
                  # Adam optimizer settings
                  beta1: float = 0.9,
                  beta2: float = 0.99,
@@ -449,9 +548,6 @@ class RWKV(L.LightningModule):
         model_weights = None
         model_keys = None
         if load_model != ".//<#|=@%!$init_model$!%@=|#>//.":
-            # Print the loading event
-            print(f"[RWKV.model]: Preloading model from '{load_model}'")
-
             # Check if the load_model path exists, and is a file
             if not os.path.isfile(load_model):
                 raise ValueError(f"load_model file '{load_model}' does not exist")
@@ -476,7 +572,7 @@ class RWKV(L.LightningModule):
         
         if vocab_size < 0:
             vocab_size = model_weights['head.weight'].shape[0]
-        
+
         # Save the various other params for later
         self.ctx_len = ctx_len
         self.ctx_len_cutoffs = ctx_len_cutoffs
@@ -490,6 +586,7 @@ class RWKV(L.LightningModule):
         self.lr_final = lr_final
         self.lr_period = lr_period
         self.lr_period_type = lr_period_type
+        self.dropout = dropout
         self.warmup_steps = warmup_steps
         self.beta1 = beta1
         self.beta2 = beta2
@@ -507,43 +604,52 @@ class RWKV(L.LightningModule):
 
         dim_att = dim_att or n_embd
         dim_ffn = dim_ffn or n_embd * 4
+        self.dim_att = dim_att
+        self.dim_ffn = dim_ffn
 
+        # Compute the RWKV-v5 n_head / headsize
+        head_size = 64
+        n_head = n_embd // head_size
+        assert n_embd % n_head == 0 ,  f"n_embd must be divisible by head_size ({self.head_size})"
+        self.n_head = n_head
+        self.head_size = head_size
+        
+        # Matmu precision check
         if torch_set_float32_matmul_precision is not None:
             torch.set_float32_matmul_precision(torch_set_float32_matmul_precision)
 
         self.emb = nn.Embedding(vocab_size, n_embd)
 
-        load(name=f"wkv_{self.ctx_len}_bf16",
-             sources=[
-                os.path.join(CUDA_DIR, "wkv_op_bf16.cpp"),
-                os.path.join(CUDA_DIR, "wkv_cuda_bf16.cu")
-            ],
-             verbose=True,
-             extra_cflags=["-std=c++17", "-O3", f"-DTmax={self.ctx_len}"],
-             extra_cuda_cflags=[
-                 "-t 4", "-std=c++17", "-res-usage", "--maxrregcount 60",
-                 "--use_fast_math", "-O3", "-Xptxas -O3",
-                 "--extra-device-vectorization", f"-DTmax={self.ctx_len}"
-             ],
-             is_python_module=False)
+        # load(name=f"wkv_{self.ctx_len}_bf16",
+        #      sources=[
+        #         os.path.join(CUDA_DIR, "wkv_op_bf16.cpp"),
+        #         os.path.join(CUDA_DIR, "wkv_cuda_bf16.cu")
+        #     ],
+        #      verbose=True,
+        #      extra_cflags=["-std=c++17", "-O3", f"-DTmax={self.ctx_len}"],
+        #      extra_cuda_cflags=[
+        #          "-t 4", "-std=c++17", "-res-usage", "--maxrregcount 60",
+        #          "--use_fast_math", "-O3", "-Xptxas -O3",
+        #          "--extra-device-vectorization", f"-DTmax={self.ctx_len}"
+        #      ],
+        #      is_python_module=False)
 
         self.blocks = nn.ModuleList([
-            Block(i, n_layer, n_embd, dim_att, dim_ffn) for i in range(n_layer)
+            Block(i, n_layer, n_embd, n_head, head_size, dropout, dim_att, dim_ffn) for i in range(n_layer)
         ])
 
         self.ln_out = nn.LayerNorm(n_embd)
         self.head = nn.Linear(n_embd, vocab_size, bias=False)
 
+        # Dropout handling
+        if dropout > 0:
+            self.drop0 = nn.Dropout(p = dropout)
+
         # load the state, and GC the original cpu copy
         if model_weights != None:
-            # Print the loading event
-            print(f"[RWKV.model]: Loading model weights ( L{self.n_layer}-D{self.n_embd}-V{self.vocab_size} )")
-
             self.load_state_dict(model_weights)
             del model_weights
             gc.collect()
-
-        print(f"[RWKV.model]: Finished initial model load")
 
     def configure_optimizers(self):
         if self.bptt_learning == False:
@@ -554,8 +660,6 @@ class RWKV(L.LightningModule):
                 if self.bptt_learning_range <= 0:
                     print("[WARNING]: unlimited bptt_learning_range across multiple GPU's has a performance penalty with datasets of mixed sizes due to its constant need to keep all GPU's in sync (consider using bptt_learning_range=1 instead)")
         
-        print(f"[RWKV.model][rank={self.trainer.local_rank}] Configuring optimizer ...")
-
         # Get the learning rate used for the optimizer
         lr_init = self.lr_init
         lr_final = self.lr_final
@@ -603,8 +707,11 @@ class RWKV(L.LightningModule):
                     lr_1x.add(n)
                 elif "time_decay" in n:
                     lr_2x.add(n)
-                elif "time_first" in n:
-                    lr_3x.add(n)
+                # V5-R2 changes
+                elif "time_faaaa" in n:
+                    lr_2x.add(n)
+                # elif "time_first" in n:
+                #     lr_3x.add(n)
                 else:
                     lr_1x.add(n)
             lr_1x = sorted(list(lr_1x))
@@ -672,7 +779,6 @@ class RWKV(L.LightningModule):
                 warmup_num_steps=self.warmup_steps,
                 warmup_type='linear')
 
-            print(f"[RWKV.model][rank={self.trainer.local_rank}] Loaded optimizer (with warmup steps) ...")
             return {
                 'optimizer': optimizer,
                 'lr_scheduler': lr_scheduler,
@@ -715,7 +821,6 @@ class RWKV(L.LightningModule):
                 total_iters=lr_total_step
             )
 
-            print(f"[RWKV.model][rank={self.trainer.local_rank}] Loaded optimizer (linear schedule) ...")
             return {
                 'optimizer': optimizer,
                 'lr_scheduler': {
@@ -781,14 +886,19 @@ class RWKV(L.LightningModule):
 
         x = self.emb(idx)
 
-        new_states = BlockStateList.empty(self.n_layer, B, self.n_embd,
+        # Handle dropout (input)
+        if self.dropout > 0.0:
+            x = self.drop0(x)
+
+        new_states = BlockStateList.empty(self.n_layer, B, self.n_embd, 
+                                          self.n_head, self.head_size,
                                           x.device, x.dtype)
         
         # last_shift_states can be None, when we are performing direct inference
         if last_shift_states is None:
             cur_bs_list = BlockStateList.create(
-                self.n_layer, B,
-                self.n_embd,
+                self.n_layer, B, self.n_embd, 
+                self.n_head, self.head_size,
                 x.device, x.dtype
             )
         else:
@@ -928,6 +1038,7 @@ class RWKV(L.LightningModule):
 
         B, T = idx.shape
         C = self.n_embd
+        total_mask_sum = torch.sum(seq_mask)
 
         # If total_mask_sum, we skip, as there is no tokens of value to learn from anyway
         if total_mask_sum == 0:
@@ -954,8 +1065,9 @@ class RWKV(L.LightningModule):
         total_loss = torch.tensor(
             0, dtype=self.emb.weight.dtype).requires_grad_()
         steps = 0
-        states = BlockStateList.create(self.n_layer, B, C, seq.device,
-                                       self.emb.weight.dtype)
+        states = BlockStateList.create(self.n_layer, B, C, 
+                                       self.n_head, self.head_size,
+                                       seq.device, self.emb.weight.dtype)
         segment_count = math.ceil(T / self.ctx_len)
 
         #
@@ -1156,6 +1268,36 @@ class RWKV(L.LightningModule):
             #    # GC collect unused memory
             #    gc.collect()
             #    # torch.cuda.empty_cache()
+        else:
+
+            # Normal operations without BPTT
+            segment_size = self.ctx_len
+            for i in range(segment_count):
+                if i < segment_count-1 and is_training_run:
+                    total_loss, new_shift_states, new_wkv_states, steps = deepspeed_checkpoint(
+                        checkpointed_step,
+                        idx[:, i * segment_size:(i + 1) * segment_size],
+                        targets[:, i * segment_size:(i + 1) * segment_size],
+                        seq_mask[:, i * segment_size:(i + 1) * segment_size],
+                        total_loss,
+                        states.shift_states,
+                        states.wkv_states,
+                        steps,
+                    )
+                else:
+                    total_loss, new_shift_states, new_wkv_states, steps = checkpointed_step(
+                        idx[:, i * segment_size:(i + 1) * segment_size],
+                        targets[:, i * segment_size:(i + 1) * segment_size],
+                        seq_mask[:, i * segment_size:(i + 1) * segment_size],
+                        total_loss,
+                        states.shift_states,
+                        states.wkv_states,
+                        steps,
+                    )
+
+                states = BlockStateList(new_shift_states, new_wkv_states)
+                gc.collect()
+                # torch.cuda.empty_cache()
 
         # Wandb logging only, if an active run exists
         if wandb.run is not None:
@@ -1219,9 +1361,6 @@ class SimpleRWKV():
             dtype:str = "fp32"
         ):
 
-        # Device type must be cuda, cpu type is not supported (yet?)
-        if device != "cuda":
-            raise NotImplementedError("Only cuda device is supported (for now)")
         # Log the mismatch dtype
         if dtype != "fp32":
             print("[SimpleRWKV] Warning: dtype mismatch, only fp32 is supported (for now)")
